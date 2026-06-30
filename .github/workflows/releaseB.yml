@@ -1,0 +1,94 @@
+name: Build Optimized Main APK B
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+env:
+  # 在这里配置你想要的新包名
+  NEW_APP_ID: "com.ONNX.VoxSherpa"
+
+jobs:
+  build-and-artifact:
+    name: Build and Upload Artifact
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Dynamic Modify Gradle and Manifest
+        run: |
+          # 1. 将 abiFilters 替换为仅保留 'arm64-v8a'
+          sed -i "s/abiFilters 'arm64-v8a', 'x86_64'/abiFilters 'arm64-v8a'/g" app/build.gradle
+          
+          # 2. 删除 debug 签名配置，以便输出未签名的包
+          sed -i "/signingConfig signingConfigs.debug/d" app/build.gradle
+          
+          # 3. 修改 build.gradle 里的 applicationId 为新包名
+          sed -i "s/applicationId \"com.CodeBySonu.VoxSherpa\"/applicationId \"${{ env.NEW_APP_ID }}\"/g" app/build.gradle
+          
+          # 4. 删除 AndroidManifest.xml 中过时的 package 属性（消除日志警告和合并冲突）
+          sed -i 's/package="com.CodeBySonu.VoxSherpa"//g' app/src/main/AndroidManifest.xml
+
+          # 5. 修复 AndroidManifest.xml 中三大 Provider 的 authorities 冲突
+          # 将 android:authorities="com.CodeBySonu.VoxSherpa 替换为 android:authorities="新包名
+          sed -i "s/android:authorities=\"com.CodeBySonu.VoxSherpa/android:authorities=\"${{ env.NEW_APP_ID }}/g" app/src/main/AndroidManifest.xml
+
+      - name: Verify Modifications
+        run: |
+          echo "========= MODIFIED build.gradle ========="
+          cat app/build.gradle
+          echo "========= MODIFIED AndroidManifest.xml ========="
+          grep "android:authorities" app/src/main/AndroidManifest.xml || true
+          head -n 5 app/src/main/AndroidManifest.xml
+          echo "================================================="
+
+      - name: Make Gradle Wrapper Executable
+        run: chmod +x ./gradlew
+
+      - name: Build Minified Release APK
+        # 此时已经解决了 Manifest 冲突，将成功构建未签名 Release APK
+        run: ./gradlew assembleRelease --no-daemon -x test -x lint
+
+      - name: Sign Release APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          # 1. Base64 解码生成签名文件
+          echo "$KEYSTORE_BASE64" | base64 --decode > app/release.keystore
+          
+          # 2. 查找 Build Tools 和未签名 APK
+          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | tail -1)
+          APK_PATH=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          
+          # 3. zipalign 对齐
+          $BUILD_TOOLS/zipalign -v -p 4 "$APK_PATH" app/build/outputs/apk/release/app-release-aligned.apk
+          
+          # 4. apksigner 签名
+          $BUILD_TOOLS/apksigner sign --ks app/release.keystore \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass "env:KEYSTORE_PASSWORD" \
+            --key-pass "env:KEY_PASSWORD" \
+            --out app/build/outputs/apk/release/app-release-signed.apk \
+            app/build/outputs/apk/release/app-release-aligned.apk
+            
+          # 5. 清理临时产物
+          rm "$APK_PATH" app/build/outputs/apk/release/app-release-aligned.apk app/release.keystore
+
+      - name: Upload APK to Actions Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoxSherpa-Main-APK
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 5
